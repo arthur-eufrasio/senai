@@ -18,7 +18,7 @@ class XRD_Surface_Scan_Process:
         self.resolution = recon_resolution_mm
         
         # Grid fino representando a superfície real (Ground Truth)
-        self.x_rs_curve = np.arange(0, self.scan_length, 10000)
+        self.x_rs_curve = np.linspace(0, self.scan_length, 10000)
         self.x_target= np.arange(0, self.scan_length, self.resolution)
         
         self.real_stress_profile = None
