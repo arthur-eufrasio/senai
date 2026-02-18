@@ -18,7 +18,8 @@ class XRD_Surface_Scan_Process:
         self.resolution = recon_resolution_mm
         
         # Grid fino representando a superfície real (Ground Truth)
-        self.x_fine = np.arange(0, self.scan_length, self.resolution)
+        self.x_rs_curve = np.arange(0, self.scan_length, 10000)
+        self.x_target= np.arange(0, self.scan_length, self.resolution)
         
         self.real_stress_profile = None
         self.measurement_points = None
@@ -35,14 +36,14 @@ class XRD_Surface_Scan_Process:
             spline_function = pickle.load(f)
             
         # Avalia a spline ao longo do eixo x da superfície
-        self.real_stress_profile = spline_function(self.x_fine)
+        self.real_stress_profile = spline_function(self.x_rs_curve)
         return self.real_stress_profile
 
     def generate_measurement_grid(self):
         """Define onde o centro do feixe de RX irá tocar a superfície."""
         # O passo (step) é calculado com base no overlap (ex: 50% overlap = 0.5 * diâmetro)
         step_size = self.beam_diameter * (1 - self.overlap)
-        self.measurement_points = np.arange(0, self.scan_length, step_size)
+        self.measurement_points = np.arange(0, self.scan_length - self.beam_radius, step_size)
         return self.measurement_points
 
     def build_convolution_matrix(self):
@@ -51,7 +52,7 @@ class XRD_Surface_Scan_Process:
         Cada linha representa uma posição do feixe (janela móvel).
         """
         n_measurements = len(self.measurement_points)
-        n_fine_points = len(self.x_fine)
+        n_fine_points = len(self.x_rs_curve)
         self.matrix_A = np.zeros((n_measurements, n_fine_points))
         
         for i, center in enumerate(self.measurement_points):
@@ -60,7 +61,7 @@ class XRD_Surface_Scan_Process:
             window_end = center + self.beam_radius
             
             # Identifica quais pontos do grid fino estão sob a mancha do feixe
-            mask = (self.x_fine >= window_start) & (self.x_fine <= window_end)
+            mask = (self.x_rs_curve >= window_start) & (self.x_rs_curve <= window_end)
             points_in_window = np.sum(mask)
             
             if points_in_window > 0:
@@ -96,7 +97,7 @@ class XRD_Surface_Scan_Process:
         plt.figure(figsize=(14, 6))
         
         # Perfil Real
-        plt.plot(self.x_fine, self.real_stress_profile, 'k--', label='Perfil Real (Superfície)', alpha=0.7)
+        plt.plot(self.x_rs_curve, self.real_stress_profile, 'k--', label='Perfil Real (Superfície)', alpha=0.7)
         
         # Medições (Barras horizontais representam o diâmetro do feixe)
         plt.errorbar(self.measurement_points, self.measured_values, 
@@ -104,7 +105,7 @@ class XRD_Surface_Scan_Process:
                      fmt='ro', capsize=0, alpha=0.5, label='Medição XRD (Abertura do Feixe)')
         
         # Reconstrução
-        plt.plot(self.x_fine, self.reconstructed_profile, 'b-', linewidth=2, label='Deconvolução (Recuperado)')
+        plt.plot(None, self.reconstructed_profile, 'b-', linewidth=2, label='Deconvolução (Recuperado)')
         
         plt.title('Simulação de Varredura de Tensão Residual em Superfície')
         plt.xlabel('Posição na Superfície (mm)')
@@ -121,10 +122,10 @@ if __name__ == "__main__":
     try:
         scan = XRD_Surface_Scan_Process(
             pkl_filename=pkl_file,
-            beam_diameter_mm=2.0,   # Feixe maior para ver o efeito de suavização
-            overlap_ratio=0.75,     # 75% de sobreposição para maior densidade de dados
+            beam_diameter_mm=0.5,   # Feixe maior para ver o efeito de suavização
+            overlap_ratio=0.5,     # 50% de sobreposição para maior densidade de dados
             noise_std_dev=10.0,     # Ruído de 10 MPa
-            scan_length_mm=20.0
+            scan_length_mm= 3.5
         )
         
         scan.run_full_process()
