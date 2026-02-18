@@ -15,121 +15,159 @@ class XRD_Surface_Scan_Process:
         self.overlap = overlap_ratio
         self.noise_std = noise_std_dev
         self.scan_length = scan_length_mm
-        self.resolution = recon_resolution_mm
         
-        # Grid fino representando a superfície real (Ground Truth)
-        self.x_rs_curve = np.linspace(0, self.scan_length, 10000)
-        self.x_target= np.arange(0, self.scan_length, self.resolution)
+        # --- DEFINIÇÃO DOS DOIS MUNDOS (GRIDS) ---
         
-        self.real_stress_profile = None
-        self.measurement_points = None
-        self.measured_values = None
-        self.reconstructed_profile = None
-        self.matrix_A = None
+        # 1. Grid de Simulação (Ground Truth): Altíssima resolução para simular a realidade contínua
+        # Usamos 0.005mm para garantir que a integral do feixe seja perfeita
+        self.x_sim = np.arange(0, self.scan_length, 0.005) 
+        
+        # 2. Grid de Reconstrução (Target): A resolução que você escolheu para o resultado final
+        self.x_recon = np.arange(0, self.scan_length, recon_resolution_mm)
+        
+        # Variáveis de Estado
+        self.real_stress_profile = None   # O perfil real no grid x_sim
+        self.measurement_centers = None   # Onde o robô parou
+        self.measured_values = None       # O vetor 'b' (com ruído)
+        self.reconstructed_profile = None # O vetor 'x' recuperado (no grid x_recon)
+        
+        # As Matrizes
+        self.A_sim = None   # Conecta x_sim -> b
+        self.A_recon = None # Conecta x_recon -> b
 
     def load_ground_truth(self):
-        """Carrega o perfil de tensão superficial de um arquivo pickle."""
+        """Carrega a função spline e gera o perfil real no grid de SIMULAÇÃO."""
         if not os.path.exists(self.pkl_filename):
             raise FileNotFoundError(f"Arquivo {self.pkl_filename} não encontrado.")
             
         with open(self.pkl_filename, "rb") as f:
             spline_function = pickle.load(f)
-            
-        # Avalia a spline ao longo do eixo x da superfície
-        self.real_stress_profile = spline_function(self.x_rs_curve)
-        return self.real_stress_profile
-
-    def generate_measurement_grid(self):
-        """Define onde o centro do feixe de RX irá tocar a superfície."""
-        # O passo (step) é calculado com base no overlap (ex: 50% overlap = 0.5 * diâmetro)
-        step_size = self.beam_diameter * (1 - self.overlap)
-        self.measurement_points = np.arange(0, self.scan_length - self.beam_radius, step_size)
-        return self.measurement_points
-
-    def build_convolution_matrix(self):
-        """
-        Cria a matriz que mapeia o perfil real para a média integrada pelo feixe.
-        Cada linha representa uma posição do feixe (janela móvel).
-        """
-        n_measurements = len(self.measurement_points)
-        n_fine_points = len(self.x_rs_curve)
-        self.matrix_A = np.zeros((n_measurements, n_fine_points))
         
-        for i, center in enumerate(self.measurement_points):
-            # Define os limites da mancha do feixe na superfície
-            window_start = center - self.beam_radius
-            window_end = center + self.beam_radius
-            
-            # Identifica quais pontos do grid fino estão sob a mancha do feixe
-            mask = (self.x_rs_curve >= window_start) & (self.x_rs_curve <= window_end)
-            points_in_window = np.sum(mask)
-            
-            if points_in_window > 0:
-                self.matrix_A[i, mask] = 1.0 / points_in_window
+        # Avalia apenas no grid de alta resolução (realidade)
+        self.real_stress_profile = spline_function(self.x_sim)
 
-    def simulate_measurements(self):
-        """Aplica a convolução e adiciona ruído gaussiano."""
-        # O produto matricial simula a integração do feixe sobre a superfície
-        clean_measurements = self.matrix_A @ self.real_stress_profile
+    def generate_measurement_points(self):
+        """Define os passos do robô."""
+        step_size = self.beam_diameter * (1 - self.overlap)
+        self.measurement_centers = np.arange(0, self.scan_length, step_size)
+
+    def _build_generic_matrix(self, target_grid):
+        """
+        Método Genérico: Constrói uma matriz A que conecta o 'target_grid' às medições.
+        Aplica a Regra de Simetria Reflexiva em X=0.
+        """
+        n_measurements = len(self.measurement_centers)
+        n_target = len(target_grid)
+        dx_target = target_grid[1] - target_grid[0]
+        
+        matrix = np.zeros((n_measurements, n_target))
+        
+        # Para otimizar, calculamos quantos pontos do grid cabem no feixe
+        # Isso define o "peso base" de cada ponto na média
+        points_per_beam = int(np.round(self.beam_diameter / dx_target))
+        if points_per_beam < 1: points_per_beam = 1
+        weight = 1.0 / points_per_beam
+
+        for i, center in enumerate(self.measurement_centers):
+            # Janela Física do Feixe
+            x_start_phys = center - self.beam_radius
+            
+            # Geramos os pontos físicos teóricos que o feixe está "lendo"
+            # Ex: se o feixe está em 0, lê de -0.25 a +0.25
+            x_samples_phys = np.linspace(x_start_phys, x_start_phys + self.beam_diameter, points_per_beam)
+            
+            for x_p in x_samples_phys:
+                # --- AQUI ESTÁ A MÁGICA DA SIMETRIA ---
+                # Se o feixe lê -0.1mm, isso corresponde à tensão em +0.1mm na peça
+                x_effective = abs(x_p)
+                
+                # Achamos qual nó do grid (índice j) está mais próximo dessa posição efetiva
+                idx_j = int(np.round(x_effective / dx_target))
+                
+                # Se o índice cair dentro do nosso grid, somamos o peso
+                if 0 <= idx_j < n_target:
+                    matrix[i, idx_j] += weight
+                    
+        return matrix
+
+    def run_simulation(self):
+        """
+        Passo 1: O Mundo Real
+        Constrói A_sim e gera as medições com ruído.
+        """
+        print("1. Construindo Matriz de Simulação (Alta Resolução)...")
+        self.A_sim = self._build_generic_matrix(self.x_sim)
+        
+        # Medição Perfeita = Matriz Simulação * Realidade Fina
+        clean_measurements = self.A_sim @ self.real_stress_profile
+        
+        # Adiciona Ruído
         noise = np.random.normal(0, self.noise_std, len(clean_measurements))
         self.measured_values = clean_measurements + noise
-        return self.measured_values
+        print(f"   -> Geradas {len(self.measured_values)} medições.")
 
-    def reconstruct_profile(self):
-        """Realiza a deconvolução usando Mínimos Quadrados com regularização básica."""
-        # rcond ajuda a lidar com a instabilidade da inversão (filtragem de ruído)
-        x_reconstructed, _, _, _ = np.linalg.lstsq(
-            self.matrix_A, 
+    def run_reconstruction(self):
+        """
+        Passo 2: A Matemática Inversa
+        Constrói A_recon (Resolução do Usuário) e inverte o sistema.
+        """
+        print(f"2. Construindo Matriz de Reconstrução (Resolução: {self.x_recon[1]}mm)...")
+        self.A_recon = self._build_generic_matrix(self.x_recon)
+        
+        print("3. Resolvendo Sistema Inverso...")
+        # Resolve: A_recon * x_recon = b_medido
+        self.reconstructed_profile, _, _, _ = np.linalg.lstsq(
+            self.A_recon, 
             self.measured_values, 
-            rcond=0.05 
+            rcond=0.05 # Filtro de regularização para estabilidade
         )
-        self.reconstructed_profile = x_reconstructed
-        return self.reconstructed_profile
 
-    def run_full_process(self):
-        self.load_ground_truth()
-        self.generate_measurement_grid()
-        self.build_convolution_matrix()
-        self.simulate_measurements()
-        self.reconstructed_profile = self.reconstruct_profile()
-
-    def plot_results(self):
-        plt.figure(figsize=(14, 6))
+    def plot_comparison(self):
+        plt.figure(figsize=(12, 7))
         
-        # Perfil Real
-        plt.plot(self.x_rs_curve, self.real_stress_profile, 'k--', label='Perfil Real (Superfície)', alpha=0.7)
+        # 1. Ground Truth (O perfil real que criamos no Step 1)
+        plt.plot(self.x_sim, self.real_stress_profile, 'k--', linewidth=1.5, alpha=0.6, label='Realidade (Ground Truth)')
         
-        # Medições (Barras horizontais representam o diâmetro do feixe)
-        plt.errorbar(self.measurement_points, self.measured_values, 
+        # 2. Medições (O que o equipamento viu)
+        plt.errorbar(self.measurement_centers, self.measured_values, 
                      xerr=self.beam_radius, yerr=self.noise_std, 
-                     fmt='ro', capsize=0, alpha=0.5, label='Medição XRD (Abertura do Feixe)')
+                     fmt='ro', capsize=0, alpha=0.4, label=f'Medição (Feixe {self.beam_diameter}mm)')
         
-        # Reconstrução
-        plt.plot(None, self.reconstructed_profile, 'b-', linewidth=2, label='Deconvolução (Recuperado)')
+        # 3. Reconstrução (O resultado da matemática)
+        plt.plot(self.x_recon, self.reconstructed_profile, 'b-', linewidth=2.5, label='Perfil Deconvolvido')
         
-        plt.title('Simulação de Varredura de Tensão Residual em Superfície')
-        plt.xlabel('Posição na Superfície (mm)')
+        plt.title(f'Deconvolução com Matrizes Independentes\nResolução Alvo: {self.x_recon[1]:.2f}mm | Overlap: {self.overlap*100:.0f}%')
+        plt.xlabel('Distância (mm)')
         plt.ylabel('Tensão (MPa)')
         plt.legend()
-        plt.grid(True, which='both', linestyle='--', alpha=0.5)
+        plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
 
+# --- EXECUÇÃO ---
 if __name__ == "__main__":
+    # Substitua pelo caminho do seu arquivo .pkl gerado anteriormente
     pkl_file = "rs_profile/martin_senai_rs_profile.pkl" 
     
-    # Exemplo de uso: Varredura de 20mm na superfície
     try:
-        scan = XRD_Surface_Scan_Process(
+        # Configuração do Experimento Virtual
+        experiment = XRD_Surface_Scan_Process(
             pkl_filename=pkl_file,
-            beam_diameter_mm=0.5,   # Feixe maior para ver o efeito de suavização
-            overlap_ratio=0.5,     # 50% de sobreposição para maior densidade de dados
-            noise_std_dev=10.0,     # Ruído de 10 MPa
-            scan_length_mm= 3.5
+            beam_diameter_mm=0.5,    # Colimador largo (gera média forte)
+            overlap_ratio=0.50,      # 60% de overlap
+            noise_std_dev=0.0,      # Ruído realista
+            scan_length_mm=3.5,      # Comprimento total
+            recon_resolution_mm=0.1  # Quero um resultado a cada 0.1mm
         )
         
-        scan.run_full_process()
-        scan.plot_results()
+        experiment.load_ground_truth()
+        experiment.generate_measurement_points()
+        
+        # Roda os dois processos separadamente
+        experiment.run_simulation()
+        experiment.run_reconstruction()
+        
+        experiment.plot_comparison()
         
     except FileNotFoundError:
-        print(f"Erro: Arquivo '{pkl_file}' não encontrado.")
+        print("Erro: Arquivo pkl não encontrado. Rode o código gerador primeiro.")
